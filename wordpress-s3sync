@@ -1,0 +1,132 @@
+#!/bin/bash
+
+# This bash script is for syncing down s3 'wp-content/uploads' content from a setup wordpress workflow site.
+
+#### Global Variables #########################################################################################################
+
+working_dir=${PWD} # Where are we right now
+
+current_depth=$(grep -o "/" <<< "${working_dir}" | wc -l) # Numerical depth of the working dir for verification purposes
+
+ExpectedDir="/srv/www/auto/" # Development directory where users folders sit
+
+BASENAME=`basename "$working_dir"` # Name of dir script is being executed from
+
+s3Bucket="wordpress-ice-box"
+
+###############################################################################################################################
+
+# White box black text - \033[40;7m
+COLORYELLOW=$(echo -e "\033[40;33m")
+COLORBLUE=$(echo -e "\033[40;34m")
+COLORGRAY=$(echo -e "\033[40;37m")
+COLORGREEN=$(echo -e "\033[40;32m")
+COLORRED=$(echo -e "\033[40;31m")
+COLORPURPLE=$(echo -e "\033[40;35m")
+COLOREND=$(echo -e "\033[0m")
+die() { echo "[ERROR] $COLORRED$@$COLOREND" >&2; exit 1; }
+
+# Center output echo text
+function center {
+	text="$1"
+	cols=`tput cols`
+	IFS=$'\n'$'\r'
+	for line in $(echo -e $text); do
+		line_length=`echo $line| wc -c`
+		half_of_line_length=`expr $line_length / 2`
+		center=`expr \( $cols / 2 \) - $half_of_line_length`
+		spaces=""
+		for ((i=0; i < $center; i++)) {
+			spaces="$spaces "
+		}
+		echo "$spaces$line"
+	done
+}
+
+# Ensure the user is in the correct directory for proper script execution
+if [ ${working_dir:0:14} = $ExpectedDir ]; then # Note - ${PWD:0:14}
+
+	# In this mess below, we check to make sure we're in the correct spot for execution, this allows the command to be run from any dir inside in the working instance.
+	IFS="/" read -ra PARTS <<< "$(pwd)" # Break up current dir into array
+	if [ ${PARTS[1]} == "srv" ]; then
+		if [ ${PARTS[2]} == "www" ]; then
+			if [ ${PARTS[3]} == "auto" ]; then
+				if [ ${PARTS[4]} == "$USER" ]; then
+					if [ ${PARTS[5]+true} ]; then
+
+						# Path to root of this project instance
+						exec_dir="/${PARTS[1]}/${PARTS[2]}/${PARTS[3]}/${PARTS[4]}/${PARTS[5]}"
+
+						if [ ! -d "$exec_dir/wp-content" ]; then
+							die "wp-content directory doesn't exist; is this a wordpress development setup instance?"
+						fi
+
+						############################################################################################
+						# COPY 'wp-content/uploads' content from live site backup on Amazon s3
+						############################################################################################
+						# Get site settings gathered from repo if properly set up
+						site_settings_file=$exec_dir"/dev-bin/settings.ini"
+
+						if [ ! -f "$site_settings_file" ]; then
+							die "Site settings config file \"$site_settings_file\" wasn't found in your site instance, execution halted"
+						fi
+
+						if [ -s "$site_settings_file" ]; then
+							# Get the variables stored in the site settings.ini file
+							source $site_settings_file
+
+							# Require that variables are set in the site settings
+							if [ -z "$STORAGE_TYPE" ]; then die "STORAGE_TYPE is unset in your site settings file located here: \"$site_settings_file\", Could not gather site wp-content/uploads files."; fi
+							if [ -z "$S3BIN_UPLOADS" ]; then die "S3BIN_UPLOADS is unset in your site settings file located here: \"$site_settings_file\", Could not gather site wp-content/uploads files."; fi
+						else
+							die "Your site instance settings file \"$site_settings_file\" has no content in it, looking for set \"STORAGE_TYPE\" and \"S3BIN_UPLOADS\" variables, Could not gather site wp-content/uploads files."
+						fi
+
+						if [ ! -d "$exec_dir/wp-content/uploads" ]; then
+							mkdir $exec_dir/wp-content/uploads
+						fi
+
+						if [ "$STORAGE_TYPE" == "s3" ]; then
+							# Execute custom script that will gather the content desired from s3
+
+							# PHP AWS SDK version, currently we want to use the AWS CLI version
+							#php /srv/config/bash/php-cli/aws/sync-bucket.php $S3BIN_UPLOADS $exec_dir/wp-content/uploads/
+
+							# AWS CLI 'aws s3 sync' command version
+							if [ "$1" == "--quiet" ]; then
+								ARGS="--quiet"
+							elif [ "$1" == "--delete" ]; then
+								ARGS="--delete"
+							else
+								ARGS=""
+							fi
+
+							echo $COLORPURPLE"Gathering 'wp-content/uploads' content from Amazon S3 bucket to '$exec_dir/wp-content/uploads/'"$COLOREND
+
+							aws s3 sync s3://$s3Bucket/$S3BIN_UPLOADS $exec_dir/wp-content/uploads/ $ARGS
+
+						else
+							die "Could not gather 'wp-content/uploads' content from s3, try running $COLORYELLOWwordpress-s3sync$COLOREND again."
+						fi
+
+						# Fin
+						exit 1;
+
+					else
+						die "This script is only executable from the development auto-sites, located at $COLORYELLOW'/srv/www/auto/$USER/*desired_project_name*'$COLOREND"
+					fi
+				else
+					die "This script is only executable from the development auto-sites, located at $COLORYELLOW'/srv/www/auto/$USER/*desired_project_name*'$COLOREND"
+				fi
+			else
+				die "This script is only executable from the development auto-sites, located at $COLORYELLOW'/srv/www/auto/$USER/*desired_project_name*'$COLOREND"
+			fi
+		else
+			die "This script is only executable from the development auto-sites, located at $COLORYELLOW'/srv/www/auto/$USER/*desired_project_name*'$COLOREND"
+		fi
+	else
+		die "This script is only executable from the development auto-sites, located at $COLORYELLOW'/srv/www/auto/$USER/*desired_project_name*'$COLOREND"
+	fi
+else
+	die "This script is only executable from the development auto-sites, located at $COLORYELLOW/srv/www/auto/$USER $COLOREND"
+fi

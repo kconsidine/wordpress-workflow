@@ -1,0 +1,587 @@
+#!/bin/bash
+
+
+
+######################################
+#	
+#	Command Options (args):
+#		wordpress-pull *git-url*
+#				Sets up working instance of a site from a git repo, using latest master branch commit, then grabs all copy of production database and upload content from s3.
+#
+#		wordpress-pull update
+#				Updates your local instance working copy of wordpress to the latest tagged stable version.
+#
+#		wordpress-pull database 
+#				Pulls down database from production using the wp-config settings to connect to database on production server, and local-config.php info to put that database on your local working copy. Overwrites existing local DB.
+#				Also produces backup of current database incase you need to switch back, backup overwrites last backup.
+#				Add '--quiet' at end of command to skip any prompts
+#
+#		wordpress-pull database stage
+#				Pulls down database from staging using the dev-bin/settings.ini to connect to database on stage server, and local-config.php info to put that database on your local working copy. Overwrites existing local DB.
+#				Also produces backup of current database incase you need to switch back, backup overwrites last backup.
+#				Add '--quiet' at end of command to skip any prompts
+#
+#		wordpress-pull database restore
+#				Using the local backup in dev-bin and the local database config in local-config this restores the database to whatever is in that backup file.
+#
+#		wordpress-pull get
+#				Use this command for a set up working instance with an existing in use production site, this will pull down file content from the production site, for getting any client installed plugins into our git,
+#				Use this before working on a client site, its only gonna pull all root level content except for the "wp" directory and the "wp-content/uploads" directory as they are handled separately.
+#				Just make sure any work you have done locally is committed and pushed to the git origin cause running the command can and will overwrite local file/plugin content, which you'll need to commit.
+#	
+######################################
+
+
+
+# This bash script is for pulling a wordpress git repo and setting it up with the correct development hooks as per liqui-site workflow
+
+#### Global Variables #########################################################################################################
+
+DATE=`date +%m-%d-%Y`
+
+working_dir=${PWD} # Where are we right now
+
+current_depth=$(grep -o "/" <<< "${working_dir}" | wc -l) # Numerical depth of the working dir for verification purposes
+
+ExpectedDir="/srv/www/auto/" # Development directory where users folders sit
+
+ExpectedGIT="git@liquisite" # What charcters to expect in a given git URL, limit to those from our current beanstalk GIT URL
+
+BASENAME=`basename "$working_dir"` # Name of dir script is being executed from
+
+CMS_dir="wp" # Folder location of wordpress CMS (don't change this!)
+
+#Wordpress_Latest="/srv/icebox/wordpress-latest" # GIT DIR - Note no trailing slash
+Wordpress_Latest="/srv/icebox/wordpress" # SVN DIR - Note no trailing slash
+
+table_prefix="dev_"
+
+GIT=`which git`
+
+# Servers
+prod="liquiserv01"
+stage="liquistage01"
+
+###############################################################################################################################
+
+# White box black text - \033[40;7m
+COLORYELLOW=$(echo -e "\033[40;33m")
+COLORBLUE=$(echo -e "\033[40;34m")
+COLORGRAY=$(echo -e "\033[40;37m")
+COLORGREEN=$(echo -e "\033[40;32m")
+COLORRED=$(echo -e "\033[40;31m")
+COLORPURPLE=$(echo -e "\033[40;35m")
+end() { echo "$COLORRED$@$COLOREND" >&2; exit 1; }
+die() { echo "[ERROR] $COLORRED$@$COLOREND" >&2; exit 1; }
+
+# Center output echo text
+function center {
+	text="$1"
+	cols=`tput cols`
+	IFS=$'\n'$'\r'
+	for line in $(echo -e $text); do
+		line_length=`echo $line| wc -c`
+		half_of_line_length=`expr $line_length / 2`
+		center=`expr \( $cols / 2 \) - $half_of_line_length`
+		spaces=""
+		for ((i=0; i < $center; i++)) {
+			spaces="$spaces "
+		}
+		echo "$spaces$line"
+	done
+}
+
+# Get head hash of current branch on main repository
+function getHash() {
+	#$GIT ls-remote --heads $REMOTE_URL | cut -d' ' -f 3 | while read remote; do #tr -d '\011'
+	$GIT ls-remote --heads $REMOTE_ORIGIN | sed -e 's/\t\+/, /g' | while read remote; do
+		#ABOVE we turn the TAB git gives us into a comma, below we create an array split by comma.
+		IFS=', ' read -a array <<< $remote
+		if [ "refs/heads/$BRANCH" == "${array[1]}" ]; then # If local branch is found in loop.
+			echo "${array[0]}" # Return head commit hash of matching branch
+		fi
+	done
+}
+
+
+# Get user settings from their home dir (users designated MySQL user/pass for development)
+settings_file="/home/$USER/.development-settings"
+if [ ! -f "$settings_file" ]; then
+	die "Your development settings file \"$settings_file\" wasn't found in your home dir, execution halted"
+fi
+
+if [ -s "$settings_file" ]
+then
+	# Get the variables stored in the users settings file
+	source $settings_file
+
+	# Require that MySQL variables are set in the developers settings
+	if [ -z "$MYSQLUSER" ]; then die "MYSQLUSER is unset in your development settings file located here: \"$settings_file\", halting execution"; fi
+	if [ -z "$MYSQLPASS" ]; then die "MYSQLPASS is unset in your development settings file located here: \"$settings_file\", halting execution"; fi
+else
+	die "Your development settings file \"$settings_file\" has no content in it, looking for set \"MYSQLUSER\" and \"MYSQLPASS\" variables, execution halted"
+fi
+
+# Ensure the user is in the correct directory for proper script execution
+if [ ${working_dir:0:14} = $ExpectedDir ]; then # Note - ${PWD:0:14}
+	IFS="/" read -ra PARTS <<< "$(pwd)" # Break up current dir into array
+	if [ ${PARTS[1]} == "srv" ] && [ ${PARTS[2]} == "www" ] && [ ${PARTS[3]} == "auto" ] && [ ${PARTS[4]} == "$USER" ] && [ ${PARTS[5]+true} ]; then
+		# The above allows the 'database' pull version of this command to run anywhere in the repo.
+
+		exec_dir="/${PARTS[1]}/${PARTS[2]}/${PARTS[3]}/${PARTS[4]}/${PARTS[5]}"
+
+		# Exit if parameter isn't entered
+		[ $# -eq 0 ] && { die "Exiting, you must specify an arguement..."; } #die "Exiting, you must specify a git repo URL. Usage: wordpress-pull git-repository-url"; }
+
+		if [[ $1 == "get" ]]; then
+
+			REMOTE_ORIGIN=$($GIT config --get remote.origin.url 2>/dev/null)
+
+			if [[ "$REMOTE_ORIGIN" == *"$ExpectedGIT"* ]]; then
+
+				site_settings_file=$exec_dir"/dev-bin/settings.ini"
+
+				if [ ! -f "$site_settings_file" ]; then
+					die "Site settings config file \"$site_settings_file\" wasn't found in your site instance, execution halted."
+				fi
+
+				if [ -s "$site_settings_file" ]; then
+					# Get the variables stored in the site settings.ini file
+					source $site_settings_file
+				else
+					die "Your site instance settings file \"$site_settings_file\" has no content in it."
+				fi
+
+				center "\033[40;7m   ATTENTION   \033[0m"
+				echo
+				read -p $CCGREEN"This command will rysnc your local working copy with what's on production, overwriting your local site content with production content, the reason to do this would be to get any plugins the client may have installed, continue? (type 'yes' to confirm or 'n' to cancel): "$CCEND
+
+				if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+					echo
+					die "Exiting..."
+				fi
+
+
+				REF=$($GIT rev-parse HEAD 2>/dev/null) # Local head hash of the branch
+				BRANCH=$($GIT rev-parse --symbolic --abbrev-ref HEAD 2>/dev/null)
+
+				HEADHASH=$(getHash) # Head hash of the remote repo, by branch
+
+				if [[ $BRANCH == "master" ]]; then
+
+					# Verify we have what settings we need for production database deployment.
+					if [ -z "$PRODUCTION_DOMAIN" ]; then die "PRODUCTION_SERVER is unset in your site settings file located here: \"$site_settings_file\", Could not continue with deployment."; fi
+					if [ -z "$PRODUCTION_SERVER" ]; then die "PRODUCTION_SERVER is unset in your site settings file located here: \"$site_settings_file\", Could not continue with deployment."; fi
+					if [ -z "$PRODUCTION_PATH" ]; then die "PRODUCTION_PATH is unset in your site settings file located here: \"$site_settings_file\", Could not continue with deployment."; fi
+
+					SERVER=$PRODUCTION_SERVER
+					SITE=$PRODUCTION_DOMAIN
+					DEPLOY_PATH=$PRODUCTION_PATH
+
+					if [ "$REF" != "$HEADHASH" ]; then # SKIP THIS IF DEPLOYMENT SET TO FORCE
+						die "Your local git repository is not in sync with the latest changes on the remote repository, save you changes, commit, then do a git pull."
+					else
+
+						DRYFLAG=""
+
+						echo $CCPURPLE"Starting the pull sync..."$CCEND
+						echo "FROM: ($SERVER)" $CCYELLOW$DEPLOY_PATH$CCEND
+						echo "TO: "$CCYELLOW$exec_dir$CCEND
+
+						rsync $DRYFLAG\
+							--progress \
+							--stats \
+							--human-readable \
+							--recursive \
+							--partial \
+							--compress \
+							--checksum \
+							"--include=.element" \
+							--exclude=Gruntfile.js \
+							--exclude=node_modules \
+							--exclude=patterns \
+							--exclude=README \
+							--exclude=Makefile \
+							--exclude=phpinfo.php \
+							"--exclude=.*" \
+							"--exclude=*.coffee" \
+							"--exclude=zbblock" \
+							"--exclude=*.git" \
+							"--exclude=*.scss" \
+							"--exclude=*.sh" \
+							"--exclude=*.sql" \
+							"--exclude=.maintenance" \
+							"--exclude=local-config.php" \
+							"--exclude=wp/" \
+							"--exclude=stage" \
+							"--exclude=dev-bin" \
+							"--exclude=wp-content/uploads/" \
+							"--exclude=wp-content/cache/" \
+							deploy@$SERVER:$DEPLOY_PATH"/*" \
+							$exec_dir"/"
+
+						echo $CCGREEN"Success!"$CCEND
+
+					fi
+				else 
+					die "Can only currently run 'wordpress-pull get' command from the master branch..."
+				fi
+			else
+				die "This command is meant to work with expected git repositories only"
+			fi
+
+		elif [[ $1 == "update" ]]; then
+			# If arg is 'update' grab the latest version of wordpress
+			local_wp_dir="/${PARTS[1]}/${PARTS[2]}/${PARTS[3]}/${PARTS[4]}/${PARTS[5]}/$CMS_dir"
+
+			cd $local_wp_dir
+
+			echo $CCPURPLE"Updating your working copy of Wordpress to the latest tagged version..."$CCEND
+
+			# Checkout wordpress at its latest tagged release
+			#git fetch --tags # Get new tags from remote
+			#latestTag=$(git describe --tags `git rev-list --tags --max-count=1`) # Get latest tag name
+			#git checkout $latestTag # Checkout latest tag
+
+			die "SVN pull intended here..."
+
+			#git checkout master
+			#git pull origin master
+
+
+			exit 1;
+
+		elif [[ $1 == "database" ]]; then
+			# If arg is 'database' we're going to connect to production and pull down the latest database with data from the local wp-config if applicable
+
+			exec_dir="/${PARTS[1]}/${PARTS[2]}/${PARTS[3]}/${PARTS[4]}/${PARTS[5]}" # Where to exec from
+
+			cd $exec_dir # Jump to the execution dir
+
+			#backup_mysql=$exec_dir/dev-bin/working-backup-$DATE.sql # Backup current database w/ date (this will keep one backup per day, overwritable)
+			backup_mysql=$exec_dir/dev-bin/working-backup.sql # Backup current database with overwrite, local to each instance (not tracked in GIT)
+
+			# Grab the current settings from the local config
+			LOCAL_DATABASE_NAME=$(php /srv/config/bash/php-cli/get_wp_config.php db_name local)
+			LOCAL_DATABASE_USER=$(php /srv/config/bash/php-cli/get_wp_config.php db_user local)
+			LOCAL_DATABASE_PASSWORD=$(php /srv/config/bash/php-cli/get_wp_config.php db_password local)
+
+			if [[ $2 == "restore" ]]; then
+
+				center "\033[40;7m   ATTENTION   \033[0m"
+				echo
+				read -p $CCGREEN"This command will restore the local database from the latest backup which would have been created when you last pulled down using this tool, continue? (type 'yes' to confirm or 'n' to cancel): "$CCEND
+
+				if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+					echo
+					die "Exiting..."
+				fi
+
+				if mysql --user="$LOCAL_DATABASE_USER" --password="$LOCAL_DATABASE_PASSWORD" $LOCAL_DATABASE_NAME < $backup_mysql; then
+					echo $CCGREEN"Sucessfully restored database from latest backup."$CCEND
+					echo
+				else
+					die "MySQL error in execution of dumping remote database contents into specified database, please try again..." ## MAKE PROPER ERROR
+				fi
+
+				# fin
+				exit 1;
+
+			elif [[ $2 == "stage" ]]; then
+				site_settings_file=$exec_dir"/dev-bin/settings.ini"
+
+				if [ ! -f "$site_settings_file" ]; then
+					die "Site settings config file \"$site_settings_file\" wasn't found in your site instance, execution halted"
+				fi
+
+				if [ -s "$site_settings_file" ]; then
+					# Get the variables stored in the site settings.ini file
+					source $site_settings_file
+
+					# Require that variables are set in the site settings
+					if [ -z "$STAGE_SERVER" ]; then die "STAGE_SERVER is unset in your site settings file located here: \"$site_settings_file\", Could not get database from stage."; fi
+					if [ -z "$STAGING_DOMAIN" ]; then die "STAGING_DOMAIN is unset in your site settings file located here: \"$site_settings_file\", Could not get database from stage."; fi
+					if [ -z "$STAGE_MYSQL_NAME" ]; then die "STAGE_MYSQL_NAME is unset in your site settings file located here: \"$site_settings_file\", Could not get database from stage."; fi
+					if [ -z "$STAGE_MYSQL_USER" ]; then die "STAGE_MYSQL_USER is unset in your site settings file located here: \"$site_settings_file\", Could not get database from stage."; fi
+					if [ -z "$STAGE_MYSQL_PASS" ]; then die "STAGE_MYSQL_PASS is unset in your site settings file located here: \"$site_settings_file\", Could not get database from stage."; fi
+				else
+					die "Your site instance settings file \"$site_settings_file\" has no content in it, looking for set \"STAGING_DOMAIN\", \"STAGE_MYSQL_NAME\", \"STAGE_MYSQL_USER\" and \"STAGE_MYSQL_PASS\" variables, Could not get database from stage."
+				fi
+
+				#DATABASE_HOST="localhost"
+				DATABASE_NAME=$STAGE_MYSQL_NAME
+				DATABASE_USER=$STAGE_MYSQL_USER
+				DATABASE_PASSWORD=$STAGE_MYSQL_PASS
+
+				SERVER=$stage
+				SITE_DOMAIN=$STAGING_DOMAIN
+				#SERVER=$STAGE_SERVER # Use server defined in the settings file
+				THISERROR="either credentials for stage in 'dev-bin/settings.ini' are incorrect, or the database '$DATABASE_NAME' doesn't exist on stage server $SERVER..."
+			else
+				site_settings_file=$exec_dir"/dev-bin/settings.ini"
+
+				if [ ! -f "$site_settings_file" ]; then
+					die "Site settings config file \"$site_settings_file\" wasn't found in your site instance, execution halted"
+				fi
+
+				if [ -s "$site_settings_file" ]; then
+					# Get the variables stored in the site settings.ini file
+					source $site_settings_file
+
+					# Require that variables are set in the site settings
+					if [ -z "$PRODUCTION_SERVER" ]; then die "PRODUCTION_SERVER is unset in your site settings file located here: \"$site_settings_file\", Could not get database."; fi
+					if [ -z "$PRODUCTION_DOMAIN" ]; then die "PRODUCTION_DOMAIN is unset in your site settings file located here: \"$site_settings_file\", Could not get database."; fi
+				else
+					die "Your site instance settings file \"$site_settings_file\" has no content in it, looking for set \"PRODUCTION_DOMAIN\", and \"PRODUCTION_SERVER\"."
+				fi
+
+				# Get production database settings from the wp-config.php file in the git repo
+				#DATABASE_HOST=$(php /srv/config/bash/php-cli/get_wp_config.php db_host 2>/dev/null) # localhost assumed
+				DATABASE_NAME=$(php /srv/config/bash/php-cli/get_wp_config.php db_name)
+				DATABASE_USER=$(php /srv/config/bash/php-cli/get_wp_config.php db_user)
+				DATABASE_PASSWORD=$(php /srv/config/bash/php-cli/get_wp_config.php db_password)
+
+				SERVER=$PRODUCTION_SERVER
+				SITE_DOMAIN=$PRODUCTION_DOMAIN
+				#SERVER=$prod
+				THISERROR="either credentials for production in wp-config.php are incorrect, or the database '$DATABASE_NAME doesn't exist on production server $SERVER..."
+			fi
+
+
+			if [[ $2 != "--quiet" ]] && [[ $3 != "--quiet" ]]; then
+				center "\033[40;7m   ATTENTION   \033[0m"
+				echo
+				read -p $CCGREEN"This command will replace your current local development database and you will lose any changes to it, continue? (type 'yes' to confirm or 'n' to cancel): "$CCEND
+
+				if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+					echo
+					die "Exiting..."
+				fi
+			fi
+
+			temp_db=$exec_dir/temp_pull.sql # Where to save / execute / delete the temproary mysql file
+
+
+			echo
+			echo $CCPURPLE"Backing up your current local database ("$CCYELLOW$LOCAL_DATABASE_NAME$CCEND$CCPURPLE") to '$backup_mysql'"$CCEND
+			mysqldump -u $LOCAL_DATABASE_USER -p$LOCAL_DATABASE_PASSWORD --skip-extended-insert $LOCAL_DATABASE_NAME > $backup_mysql || die "MySQL error when backing up current database!"
+
+			echo
+			echo $CCPURPLE"Pulling database '$DATABASE_NAME' from "$CCYELLOW$SERVER$CCEND$CCPURPLE" to local database '$LOCAL_DATABASE_NAME'..."$CCEND
+			ssh $SERVER "mysql --user='$DATABASE_USER' --password='$DATABASE_PASSWORD' --execute=\"SHOW DATABASES LIKE '$DATABASE_NAME';\"" &> /dev/null || die "Couldn't execute MySQL command to remote server '$SERVER', $THISERROR"
+			# Redundant, but I don't care...
+			ssh $SERVER "mysqldump -u'$DATABASE_USER' -p'$DATABASE_PASSWORD' -hlocalhost $DATABASE_NAME" > $temp_db || die "Couldn't get MySQL dump from remote server '$SERVER'"
+
+			if mysql --user="$LOCAL_DATABASE_USER" --password="$LOCAL_DATABASE_PASSWORD" $LOCAL_DATABASE_NAME < $temp_db; then
+				rm -f $temp_db # Get rid of temp file
+				echo $CCGREEN"Sucessfully inserted database dump from site '$SITE_DOMAIN' on remote server '$SERVER', (DB: $DATABASE_NAME) into '$LOCAL_DATABASE_NAME'."$CCEND
+				echo
+			else
+				rm -f $temp_db # Get rid of temp file
+				die "MySQL error in execution of dumping remote database contents into specified database, please try again..." ## MAKE PROPER ERROR
+			fi
+
+			# fin
+			exit 1;
+
+		else # no database arg
+			
+			if [[ $1 == *"$ExpectedGIT"* ]]; then
+				if [ $current_depth == "5" ]; then
+
+					# Check if the directory where executed is empty
+					if [ "$(ls -A $working_dir)" ]; then
+						die "The current directory must be empty for this script to run properly, execution halted"
+					else
+						# Prompt for user define database name
+						echo
+						echo $CCGREEN"Type a database name for this wordpress installation, if it already exists its tables will be overwritten by the database version on the remote git repo: "$CCEND
+						read input_db
+
+						input_database=$table_prefix""$USER"_"$input_db
+
+						if [ -z "$input_database" ]; then
+							die "You must enter a database name!"
+						fi
+
+						check_database_exists=`mysql --user="$MYSQLUSER" --password="$MYSQLPASS" --execute="SHOW DATABASES LIKE '$input_database';"`
+
+						if [ -z "$check_database_exists" ]; then
+							# Database doesn't exist, create it.
+							center "\033[40;7m   ATTENTION   \033[0m"
+							echo
+							read -p $CCGREEN"Database \"$input_database\" will be created and filled with data from the production database (if applicable), continue? (type 'yes' to confirm or 'n' to cancel): "$CCEND
+
+							if [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+								echo
+								die "Exiting..."
+							fi
+
+							if mysql --user="$MYSQLUSER" --password="$MYSQLPASS" --execute="CREATE DATABASE IF NOT EXISTS $input_database;"; then
+								populate_data=true
+								use_database=$input_database
+								echo "Created database \"$use_database\""
+							else
+								die "MySQL error in execution of creating new database, please try again"
+							fi
+
+						else
+							# Database exists, confirm - then empty it.
+							center "\033[33;7m   ATTENTION   \033[0m"
+							echo
+							read -p $CCGREEN"The specified database ($input_database) exists already, its tables will be overwritted, continue? (type 'yes' to confirm, 'skip' (advanced) to use this database with its existing tables, or 'n' to cancel): "$CCEND
+							
+							if [[ $REPLY =~ ^[Ss][Kk][Ii][Pp]$ ]]; then
+
+								populate_data=false
+								use_database=$input_database
+								echo "Selected database \"$use_database\", not flushing database / keeping current table content ($CCYELLOWthis could result in errors if existing dev DB is not configured properly!$CCEND)"
+
+							elif [[ ! $REPLY =~ ^[Yy][Ee][Ss]$ ]]; then
+								echo
+								die "Exiting..."
+							else
+								populate_data=true
+								use_database=$input_database
+								echo "Selected database \"$use_database\", overwriting any existing table content"
+							fi
+
+						fi
+
+						####################### GIT EXECUTION FUNCTIONS BELOW #######################
+
+						echo $CCPURPLE"Creating git repository locally and pulling from specified source..."$CCEND
+
+						git init .
+						git remote add -t \* -f origin $1 #|| fail "GIT failed, possibly bad URL supplied or the SSH key isn't setup. Please try again."
+						git checkout master
+
+
+						# Variables used for generating files from templates (templates located in /srv/config/bash/templates)
+						param1=$input_database
+						param2=$MYSQLUSER
+						param3=$MYSQLPASS
+
+						## No longer executing database from repository, instead doing pull from live
+						# Param4 below is the database sql dump we will execute for our instance
+						#param4=$working_dir"/dev-bin/database.sql" #MySQL Dump to use, currently gathered from the git repo itself
+
+						#hookfile=$working_dir"/.git/hooks/pre-commit"
+
+
+						#sed -e "s|:DBNAME:|$param1|g" \
+							#-e "s|:DBUSER:|$param2|g" \
+							#-e "s|:DBPASS:|$param3|g" \
+							#-e "s|:DBFILE:|$param4|g" \
+							#/srv/config/bash/templates/git-hook-pre-commit > $hookfile
+
+						# make the hook we just created executable
+						#chmod +x $hookfile
+
+						echo $CCPURPLE"Creating local-config.php file in repository using your database settings..."$CCEND
+
+						# Use template file to generate the local-config file, using variables above to fill out template vars
+						sed -e "s|:DBNAME:|$param1|g" \
+							-e "s|:DBUSER:|$param2|g" \
+							-e "s|:DBPASS:|$param3|g" \
+							-e "s|:CMSDIR:|$CMS_dir|g" \
+							/srv/config/bash/templates/wordpress-local-config > $working_dir"/local-config.php"
+
+
+						if [ "$populate_data" == true ]; then
+
+							wordpress-pull database
+
+							# No longer executing database from repository, instead doing pull from live
+							#if mysql --user="$MYSQLUSER" --password="$MYSQLPASS" $input_database < $param4; then
+								#echo $CCPURPLE"Sucessfully inserted database dump from repository into specified database."$CCEND
+							#else
+								#die "MySQL error in execution of dumping repository database contents into specified database, please try again " ## MAKE PROPER ERROR
+							#fi
+
+						else 
+							echo "Skipping populating the developer selected database ($use_database)..."
+						fi
+							
+
+						############################################################################################
+						# COPY LATEST WORDPRESS INTO THE CMS DIR HERE
+						############################################################################################
+						mkdir $CMS_dir
+
+						echo $CCPURPLE"Updating our development server Wordpress repository version to the latest (White text below is response from that git update, ignore unless errors)..."$CCEND
+
+						cd $Wordpress_Latest
+
+						##########################################################################################
+						## GIT VERSION OF GATHERING WORDPRESS HERE, CURRENTLY DISABLED
+
+						#git pull # We don't want latest revision, we want latest release version
+
+						# Checkout wordpress at its latest tagged release
+						#git fetch --tags # Get new tags from remote
+						#latestTag=$(git describe --tags `git rev-list --tags --max-count=1`) # Get latest tag name
+						#git checkout $latestTag # Checkout latest tag
+						##git checkout master
+						##git pull origin master
+
+						##########################################################################################
+
+
+						##########################################################################################
+						## SVN VERSION OF GATHERING WORDPRESS HERE
+
+						## Get the latest wordpress commits and tags, --ignore externals ignores the dumb askimet plugin
+						svn update --ignore-externals || fail "Unable to update the local wordpress SVN"
+
+						latestTag=`svn ls $Wordpress_Latest/tags/ | tail -n 1`
+
+						# TODO, COMPARE LOCAL LATEST TAG TO REMOTE LATEST TAG
+						#remoteTag = `svn ls https://core.svn.wordpress.org/tags | tail -n 1`
+
+						##########################################################################################
+
+						wp_path=$Wordpress_Latest"/tags/"$latestTag"wp-includes/version.php"
+
+						# Output version as described in the wp version file
+						wp_version="$(grep -oE '\$wp_version = .*;' $wp_path | tail -1 | sed 's/$wp_version = //g;s/;//g')"
+
+
+						echo $CCGREEN"Local Wordpress Version: "$CCYELLOW""$wp_version""$CCEND$CCEND
+						echo $CCPURPLE"Mirroring latest Wordpress in this new working environment..."$CCEND
+
+						cd $working_dir # Jump back to dir we ran from
+
+						##########################################################################################
+						# If using GIT
+						#cp -a $Wordpress_Latest/. $working_dir/$CMS_dir/
+
+						# If using SVN
+						cp -a $Wordpress_Latest/tags/$latestTag. $working_dir/$CMS_dir/
+						##########################################################################################
+
+
+						############################################################################################
+						# Sync 'wp-content/uploads' content from live site backup on Amazon s3
+						############################################################################################
+						wordpress-s3sync --quiet
+
+						center "\033[40;32m Success! Visit your new wordpress dev site here: http://$BASENAME.$USER.dev.liqui-site.com \033[0m"
+
+						# Fin
+						exit 1;
+
+					fi # End is dir empty for git pull
+				else
+					die "You must execute this script from your user development directory in the root of a project folder, located at $CCYELLOW/srv/www/auto/$USER/*desired_project_name* $CCEND";
+				fi
+			else
+				die "Command parameter must be a valid git SSH URL sourced from the expected git. (HTTPS URLs won't work) IE: wordpress-pull git@liquisite.git.beanstalkapp.com:/liquisite/liquisite.git"
+			fi
+		fi # end first arg command filter
+	else
+		die "You must execute this script from your own user development directory in a project folder, located at $CCYELLOW/srv/www/auto/$USER/*desired_project_name* $CCEND";
+	fi
+else
+	die "This script is only executable from the development auto-sites, in your own user directory, located at $CCYELLOW/srv/www/auto/$USER $CCEND"
+fi
